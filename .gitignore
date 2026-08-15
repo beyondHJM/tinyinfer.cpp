@@ -1,0 +1,5 @@
+build/
+*.log
+*.nsys-rep
+*.sqlite
+.DS_Store
