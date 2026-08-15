@@ -1,39 +1,41 @@
 # tinyinfer.cpp
 
-一个轻量级的 LLM 推理引擎：约 3000 行 C++/CUDA，自包含、仅 NVIDIA GPU，
-**零第三方 CUDA 库依赖**（不使用 cuBLAS / cuDNN / cuBLASLt / CUTLASS）。
+A lightweight LLM inference engine in ~3000 lines of C++/CUDA: self-contained,
+NVIDIA GPU only, and **zero third-party CUDA library dependencies**
+(no cuBLAS / cuDNN / cuBLASLt / CUTLASS).
 
-参考 llama.cpp 的推理思路裁剪/重写而成，默认适配 Qwen3-0.6B（BF16, GGUF）：
-模型超参全部从 GGUF 元数据读取并校验，不硬编码。
+It is a trimmed/rewritten implementation inspired by llama.cpp, tuned for
+Qwen3-0.6B (BF16, GGUF) out of the box. Model hyperparameters are read from and
+validated against the GGUF metadata — nothing is hardcoded.
 
-## 特性
+## Features
 
-- 离线批处理推理：一次运行可处理多条 prompt
-- 仅 NVIDIA GPU（CUDA 12.x, sm_80），无 CPU 回退
-- 自研 CUDA 算子：BF16 tensor-core GEMM、decode 专用 split-K GEMM、
-  GQA causal attention、NeoX RoPE、RMSNorm、SwiGLU、LM head
-- 自包含 Qwen3 BPE tokenizer（字节编码 + Qwen2 预分词）
-- 对话模式（`--chat`，Qwen3 im_start/im_end 模板）
-- 算子自测：`QWEN_SELFTEST=1`
+- Offline batched inference: multiple prompts in a single run
+- NVIDIA GPU only (CUDA 12.x, sm_80), no CPU fallback
+- Custom CUDA kernels: BF16 tensor-core GEMM, split-K GEMM for decode,
+  GQA causal attention, NeoX RoPE, RMSNorm, SwiGLU, LM head
+- Self-contained Qwen3 BPE tokenizer (byte encoding + Qwen2 pre-tokenizer)
+- Chat mode (`--chat`, Qwen3 im_start/im_end template)
+- Operator self-test: `QWEN_SELFTEST=1`
 
 ## Quick Start
 
-### 1. 下载
+### 1. Download
 
 ```bash
 git clone https://github.com/beyondHJM/tinyinfer.cpp
 cd tinyinfer.cpp
 ```
 
-### 2. 编译
+### 2. Build
 
-依赖：CMake >= 3.18、CUDA 12.x、gcc/g++（Linux）或 MSVC（Windows）。
+Requirements: CMake >= 3.18, CUDA 12.x, gcc/g++ (Linux) or MSVC (Windows).
 
 ```bash
 ./scripts/build.sh
 ```
 
-或手动：
+Or manually:
 
 ```bash
 export PATH=/usr/local/cuda/bin:$PATH
@@ -41,23 +43,23 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j "$(nproc)"
 ```
 
-### 3. 安装（可选）
+### 3. Install (optional)
 
 ```bash
 cp build/tinyinfer /usr/local/bin/
 ```
 
-### 4. 运行 Demo
+### 4. Run a Demo
 
-需要 Qwen3-0.6B 的 BF16 GGUF 模型文件（约 1.1 GiB，可从 HuggingFace 或
-ModelScope 下载，例如 `Qwen3_0.6B.BF16.gguf`）。
+You need a Qwen3-0.6B BF16 GGUF model (~1.1 GiB; downloadable from HuggingFace
+or ModelScope, e.g. `Qwen3_0.6B.BF16.gguf`).
 
 ```bash
 ./build/tinyinfer -m /path/to/Qwen3_0.6B.BF16.gguf \
     -n 128 -p "Please introduce AI Agent briefly" --chat
 ```
 
-输出示例（A100 实测）：
+Sample output (measured on an A100):
 
 ```text
 [output] Okay, the user wants me to introduce an AI Agent briefly. Let me start
@@ -67,44 +69,47 @@ questions, providing information, or even making decisions. But I need to make
 sure I explain it clearly without getting too technical.
 ```
 
-## 命令行参数
+## Command-Line Arguments
 
-| 参数 | 说明 |
-|------|------|
-| `-m` | GGUF 模型路径（Qwen3 架构、BF16） |
-| `-n` | 每个序列最大生成 token 数 |
-| `-p` | prompt（可重复） |
-| `-f` | prompt 文件（每行一条） |
-| `--chat` | 对话模式（Qwen3 chat 模板） |
-| `-t` / `--top-k` / `--top-p` / `--seed` | 采样参数（`-t 0` 为 greedy） |
-| `--max-seq` | KV cache 每序列最大长度（默认 2048） |
-| `--verbose` | 打印 token 级信息 |
+| Argument | Description |
+|----------|-------------|
+| `-m` | Path to the GGUF model (Qwen3 architecture, BF16) |
+| `-n` | Max tokens to generate per sequence |
+| `-p` | Prompt (repeatable) |
+| `-f` | Prompt file (one prompt per line) |
+| `--chat` | Chat mode (Qwen3 chat template) |
+| `-t` / `--top-k` / `--top-p` / `--seed` | Sampling parameters (`-t 0` = greedy) |
+| `--max-seq` | Max KV-cache length per sequence (default 2048) |
+| `--verbose` | Print token-level information |
 
-## 批处理示例
+## Batch Example
 
 ```bash
-printf 'Hello\nPlease introduce AI Agent\n' > prompts.txt
+printf 'Hello\nPlease introduce AI Agent briefly\n' > prompts.txt
 ./build/tinyinfer -m model.gguf -n 128 -f prompts.txt
 ```
 
-## 正确性与性能
+## Correctness & Performance
 
-- **算子自测**：`QWEN_SELFTEST=1 ./build/tinyinfer`，gemm / rms_norm / rope /
-  attention 与 CPU 参考逐值对比，全部通过
-- **数值对齐**：与 llama.cpp 同一模型同一 prompt 的 logits 最大绝对误差 < 0.1，
-  top-10 完全一致
-- **性能**：A100 上单序列 decode 约 180 tok/s，为 llama.cpp `simple.cpp`
-  的 ~96%（超过计划目标 80%）
+- **Operator self-test**: `QWEN_SELFTEST=1 ./build/tinyinfer` — gemm / rms_norm /
+  rope / attention are verified against CPU references.
+- **Numerical alignment**: logits for the same model and prompt differ from
+  llama.cpp by < 0.1 max absolute error; top-10 tokens match exactly.
+- **Performance**: ~180 tok/s single-sequence decode on an A100, ~96% of
+  llama.cpp's `simple.cpp` baseline.
 
-## 模块来源
+## Module Provenance
 
-- `src/tokenizer.cpp`：BPE 与 Qwen2 预分词裁剪自 llama.cpp（MIT License）
-- `src/cuda/rope.cu`：NeoX RoPE 公式与 llama.cpp 一致
-- 其余（GGUF 解析、模型结构、推理循环、GEMM/attention/FFN kernel）为本工程实现
+- `src/tokenizer.cpp`: BPE and Qwen2 pre-tokenizer trimmed from llama.cpp
+  (MIT License)
+- `src/cuda/rope.cu`: NeoX RoPE formula consistent with llama.cpp
+- Everything else (GGUF parsing, model structure, inference loop, GEMM /
+  attention / FFN kernels) is implemented in this repository.
 
-## 说明
+## Note
 
-本仓库所有代码均由 **deepseek-v4-flash + Codex** 自动生成，用时约 **1~2 小时**。
+All code in this repository was auto-generated by **deepseek-v4-flash + Codex**
+in approximately **1~2 hours**.
 
 ## License
 
