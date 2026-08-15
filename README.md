@@ -91,7 +91,7 @@ printf 'Hello\nPlease introduce AI Agent briefly\n' > prompts.txt
 
 ## Correctness & Performance
 
-- **Operator self-test**: `QWEN_SELFTEST=1 ./build/tinyinfer` — gemm / rms_norm /
+- **Operator self-test**: `QWEN_SELFTEST=1 ./build/tinyinfer` - gemm / rms_norm /
   rope / attention are verified against CPU references.
 - **Numerical alignment**: logits for the same model and prompt differ from
   llama.cpp by < 0.1 max absolute error; top-10 tokens match exactly.
