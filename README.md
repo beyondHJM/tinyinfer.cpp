@@ -113,4 +113,4 @@ in approximately **1~2 hours**.
 
 ## License
 
-MIT
+Apache License 2.0 - see [LICENSE.txt](LICENSE.txt).
