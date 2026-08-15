@@ -6,7 +6,7 @@ NVIDIA GPU only, and **zero third-party CUDA library dependencies**
 
 It is a trimmed/rewritten implementation inspired by llama.cpp, tuned for
 Qwen3-0.6B (BF16, GGUF) out of the box. Model hyperparameters are read from and
-validated against the GGUF metadata — nothing is hardcoded.
+validated against the GGUF metadata - nothing is hardcoded.
 
 ## Features
 
