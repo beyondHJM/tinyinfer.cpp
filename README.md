@@ -1,5 +1,8 @@
 # tinyinfer.cpp
 
+[![GitHub](https://img.shields.io/github/stars/beyondHJM/tinyinfer.cpp?style=social)](https://github.com/beyondHJM/tinyinfer.cpp)
+[![GitHub license](https://img.shields.io/github/license/beyondHJM/tinyinfer.cpp)](https://github.com/beyondHJM/tinyinfer.cpp/blob/master/LICENSE.txt)
+
 A lightweight LLM inference engine in ~3000 lines of C++/CUDA: self-contained,
 NVIDIA GPU only, and **zero third-party CUDA library dependencies**
 (no cuBLAS / cuDNN / cuBLASLt / CUTLASS).
