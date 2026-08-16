@@ -37,20 +37,27 @@ int sample_token(const float * logits, int n_vocab, const SampleParams & sp) {
         return best;
     }
 
+    // Top-K selection instead of a full sort of all n_vocab logits
+    // (full sort is O(vocab log vocab), which dominates the decode step).
     std::vector<std::pair<float, int>> scored;
     scored.reserve(n_vocab);
     for (int i = 0; i < n_vocab; ++i) {
-        if (std::isfinite(logits[i])) scored.push_back({logits[i] / sp.temp, i});
+        if (std::isfinite(logits[i])) scored.push_back({logits[i], i});
+    }
+    const int K = std::max(1, std::min((int) scored.size(),
+                                       sp.top_k > 0 ? sp.top_k : 512));
+    if ((int) scored.size() > K) {
+        std::nth_element(scored.begin(), scored.begin() + K, scored.end(),
+                         [](const auto & a, const auto & b) { return a.first > b.first; });
+        scored.resize(K);
     }
     std::sort(scored.begin(), scored.end(),
               [](const auto & a, const auto & b) { return a.first > b.first; });
 
-    if (sp.top_k > 0 && (int) scored.size() > sp.top_k) scored.resize(sp.top_k);
-
     float maxv = scored.empty() ? 0.0f : scored[0].first;
     double sum = 0.0;
     for (auto & s : scored) {
-        s.first = expf(s.first - maxv);
+        s.first = expf(s.first / sp.temp - maxv);
         sum += s.first;
     }
     if (sp.top_p < 1.0f && !scored.empty()) {
@@ -79,7 +86,8 @@ int sample_token(const float * logits, int n_vocab, const SampleParams & sp) {
 void print_usage(const char * prog) {
     fprintf(stderr,
             "usage: %s -m model.gguf -n max_tokens -p \"prompt\" [-p \"prompt2\" ...] [-f prompts.txt]\n"
-            "  [-t temp] [--top-k K] [--top-p P] [--seed S] [--max-seq N] [--verbose]\n",
+            "  [-t temp] [--top-k K] [--top-p P] [--seed S] [--max-seq N] [--cuda-graph] [--verbose]\n"
+            "  --cuda-graph: replay the decode phase with CUDA Graphs (off by default)\n",
             prog);
 }
 
@@ -123,6 +131,7 @@ int main(int argc, char ** argv) {
     int max_seq = 2048;
     bool verbose = false;
     bool chat = false;
+    bool use_cuda_graph = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
@@ -139,6 +148,7 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) sp.top_p = (float) atof(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) sp.seed = strtoull(argv[++i], nullptr, 10);
         else if (strcmp(argv[i], "--max-seq") == 0 && i + 1 < argc) max_seq = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--cuda-graph") == 0) use_cuda_graph = true;
         else if (strcmp(argv[i], "--verbose") == 0) verbose = true;
         else if (strcmp(argv[i], "--chat") == 0) chat = true;
         else {
@@ -195,6 +205,7 @@ int main(int argc, char ** argv) {
 
     Inference infer;
     if (!infer.init(model, max_seq, n_seqs)) return 1;
+    infer.set_use_cuda_graph(use_cuda_graph);
 
     // ---------------- prefill ----------------
     std::vector<int32_t> batch_tokens;
@@ -288,7 +299,8 @@ int main(int argc, char ** argv) {
         printf("[output] %s\n", chat ? strip_think_blocks(output[s]).c_str() : output[s].c_str());
     }
     fprintf(stderr, "main: prefill: %.1f ms (%d tokens)\n", prefill_ms, total_tokens);
-    fprintf(stderr, "main: decode: %.1f ms, %d tokens, %.1f tok/s\n",
-            decode_ms, generated, generated / (decode_ms / 1000.0));
+    fprintf(stderr, "main: decode: %.1f ms, %d tokens, %.1f tok/s [cuda-graph: %s]\n",
+            decode_ms, generated, generated / (decode_ms / 1000.0),
+            use_cuda_graph ? "on" : "off");
     return 0;
 }

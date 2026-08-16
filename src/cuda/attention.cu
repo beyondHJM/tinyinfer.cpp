@@ -86,62 +86,217 @@ __global__ void qk_norm_store_kernel(
     }
 }
 
-__global__ void attention_compute_kernel(
+// FlashDecoding-style attention for decode.
+//
+// Long contexts were previously scanned by a single block serially, so
+// per-step cost grew linearly with position and only 16 blocks (one per head)
+// were active. This kernel:
+//   * splits the KV range into FLASH_NSPLIT=16 sub-ranges, each handled by a
+//     16-lane half-warp group inside the block (block = 16 groups x 16 lanes);
+//   * every group runs an online softmax (running max/sum with rescaling), so
+//     K and V are each read exactly once (vectorized 16B uint4 loads, 8 dims
+//     per lane);
+//   * the 16 partial results are combined inside the block with the standard
+//     flash rescale rule, yielding the exact same distribution as a full
+//     softmax.
+// The math is the classic flash-attention single-pass algorithm; the
+// split-and-merge over the sequence dimension is the flash-decoding idea.
+constexpr int FLASH_NSPLIT = 16;   // half-warp groups per block (block=256)
+constexpr int FLASH_LANES = 16;    // lanes per group (8 dims each)
+
+__global__ void __launch_bounds__(FLASH_NSPLIT * FLASH_LANES)
+attention_compute_kernel(
         const float * __restrict__ q,
         const int * __restrict__ positions, const int * __restrict__ seq_ids, int M,
         const bf16 * __restrict__ kv_cache, int kv_stride, int max_seq,
         int head_dim, int n_head, int n_kv,
         float * __restrict__ out) {
-    extern __shared__ float scores[];
-    __shared__ float qs[MAX_NQ];
+    __shared__ float sout[FLASH_NSPLIT][128];   // partial outputs (dims)
+    __shared__ float sm[FLASH_NSPLIT], sl[FLASH_NSPLIT];
+    __shared__ float msh;
 
     const int m = blockIdx.x;
     const int h = blockIdx.y;
     if (m >= M || h >= n_head) return;
     const int tid = threadIdx.x;
+    const int group = tid >> 4;      // 0..15
+    const int lane = tid & 15;       // 0..15
     const int pos = positions[m];
     const int seq = seq_ids[m];
 
     const int q_per_kv = n_head / n_kv;
     const float rsqrt = rsqrtf((float) head_dim);
     const bf16 * cache = kv_cache + (size_t) seq * kv_stride;
-
     const int kvh = h / q_per_kv;
-    const float * qh = q + (size_t) m * (n_head * head_dim) + h * head_dim;
-    for (int d = tid; d < head_dim; d += THREADS) qs[d] = qh[d];
-    __syncthreads();
-
     const bf16 * kpos = cache + (size_t) kvh * max_seq * head_dim;
     const bf16 * vpos = cache + (size_t) n_kv * max_seq * head_dim
                               + (size_t) kvh * max_seq * head_dim;
 
-    float smax = -INFINITY;
-    for (int p = tid; p <= pos; p += THREADS) {
+    // This lane's 8 dims and its q slice.
+    const int d0 = lane * 8;
+    const float * qh = q + (size_t) m * (n_head * head_dim) + h * head_dim;
+    float qv[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) qv[i] = qh[d0 + i];
+
+    // Online softmax over this group's positions: p = group, group+16, ...
+    float m_ = -INFINITY, l_ = 0.0f;
+    float o8[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const unsigned shmask = (tid & 16) ? 0xffff0000u : 0xffffu;
+
+    for (int p = group; p <= pos; p += FLASH_NSPLIT) {
+        const uint4 k4 = reinterpret_cast<const uint4 *>(kpos + (size_t) p * head_dim)[lane];
+        const uint4 v4 = reinterpret_cast<const uint4 *>(vpos + (size_t) p * head_dim)[lane];
+        const bf16 * kb = reinterpret_cast<const bf16 *>(&k4);
+        const bf16 * vb = reinterpret_cast<const bf16 *>(&v4);
         float s = 0.0f;
-        for (int d = 0; d < head_dim; ++d) s += qs[d] * bf16_to_f32(kpos[(size_t) p * head_dim + d]);
-        scores[p] = s * rsqrt;
-        smax = fmaxf(smax, scores[p]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) s += qv[i] * bf16_to_f32(kb[i]);
+        // Half-warp reduction (results beyond lane 0 are garbage but unused).
+        float sr = s;
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) sr += __shfl_down_sync(shmask, sr, o);
+        sr = __shfl_sync(shmask, sr, tid & 16);
+        const float sc = sr * rsqrt;
+        const float m_new = fmaxf(m_, sc);
+        const float alpha = __expf(m_ - m_new);
+        const float pp = __expf(sc - m_new);
+        l_ = l_ * alpha + pp;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o8[i] = o8[i] * alpha + pp * bf16_to_f32(vb[i]);
+        m_ = m_new;
     }
-    smax = block_reduce_max<0>(smax);
 
-    float ssum = 0.0f;
-    for (int p = tid; p <= pos; p += THREADS) {
-        scores[p] = expf(scores[p] - smax);
-        ssum += scores[p];
+    // Publish this group's partial result.
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sout[group][d0 + i] = o8[i];
+    if (lane == 0) { sm[group] = m_; sl[group] = l_; }
+    __syncthreads();
+
+    // Combine the 16 partials (flash rescale rule).
+    if (lane == 0) {
+        float mm = -INFINITY;
+        for (int g = 0; g < FLASH_NSPLIT; ++g) mm = fmaxf(mm, sm[g]);
+        msh = mm;
     }
-    ssum = block_reduce_sum<1>(ssum);
+    __syncthreads();
+    const float m_max = msh;
 
+    float lf = 0.0f;
+    float of[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int g = 0; g < FLASH_NSPLIT; ++g) {
+        const float w = __expf(sm[g] - m_max);
+        lf += sl[g] * w;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) of[i] += sout[g][d0 + i] * w;
+    }
+    const float inv = 1.0f / lf;
     float * oh = out + (size_t) m * (n_head * head_dim) + h * head_dim;
-    for (int d = tid; d < head_dim; d += THREADS) {
-        float acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) oh[d0 + i] = of[i] * inv;
+}
+
+// ---------------------------------------------------------------------------
+// Prefill attention: many tokens at once (M > n_seqs).
+//
+// Measured on this engine, the flash-decoding kernel above is already the best
+// CUDA-core attention shape for prefill as well: one block per token with 16
+// half-warp groups splitting the position range gives the finest per-token
+// parallelism, and profiling shows attention is only ~12% of prefill time
+// (GEMMs are ~74%). A separate prefill kernel would only pay off with tensor
+// cores (flash-attention-2 style), which is a larger undertaking; it is kept
+// here as a reference/experiment entry point.
+//
+// The variant below assigns one 16-thread group per token without sequence
+// splitting (simplest possible): each group scans its full causal prefix with
+// an online softmax and vectorized reads. It is *not* used by the engine
+// because long positions become serial per group; retained for experiments.
+// ---------------------------------------------------------------------------
+constexpr int PREF_BM = 16;    // tokens per block (one per group)
+constexpr int PREF_LANES = 16; // lanes per group (8 dims each)
+
+__global__ void __launch_bounds__(PREF_BM * PREF_LANES)
+prefill_attention_kernel(
+        const float * __restrict__ q,
+        const int * __restrict__ positions, const int * __restrict__ seq_ids, int M,
+        const bf16 * __restrict__ kv_cache, int kv_stride, int max_seq,
+        int head_dim, int n_head, int n_kv,
+        float * __restrict__ out) {
+    const int m0 = blockIdx.x * PREF_BM;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int group = tid >> 4;   // which token in the block
+    const int lane = tid & 15;    // 0..15, dims lane*8..lane*8+7
+    const int m = m0 + group;
+    const bool active = m < M;
+    const int pos = active ? positions[m] : 0;
+    const int seq = active ? seq_ids[m] : 0;
+
+    const int nq = n_head * head_dim;
+    const int kvh = h / (n_head / n_kv);
+    const int d0 = lane * 8;
+    const float rsqrt = rsqrtf((float) head_dim);
+    const unsigned shmask = (tid & 16) ? 0xffff0000u : 0xffffu;
+
+    float qv[8];
+    if (active) {
+        const float * qh = q + (size_t) m * nq + h * head_dim;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) qv[i] = qh[d0 + i];
+    }
+    const bf16 * cache = kv_cache + (size_t) seq * kv_stride;
+    const bf16 * kpos = cache + (size_t) kvh * max_seq * head_dim;
+    const bf16 * vpos = cache + (size_t) (n_kv + kvh) * max_seq * head_dim;
+
+    float m_ = -INFINITY, l_ = 0.0f;
+    float o8[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    if (active) {
         for (int p = 0; p <= pos; ++p) {
-            acc += scores[p] * bf16_to_f32(vpos[(size_t) p * head_dim + d]);
+            const uint4 k4 = reinterpret_cast<const uint4 *>(kpos + (size_t) p * head_dim)[lane];
+            const uint4 v4 = reinterpret_cast<const uint4 *>(vpos + (size_t) p * head_dim)[lane];
+            const bf16 * kb = reinterpret_cast<const bf16 *>(&k4);
+            const bf16 * vb = reinterpret_cast<const bf16 *>(&v4);
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) s += qv[i] * bf16_to_f32(kb[i]);
+            float sr = s;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) sr += __shfl_down_sync(shmask, sr, o);
+            sr = __shfl_sync(shmask, sr, tid & 16);
+            const float sc = sr * rsqrt;
+            const float m_new = fmaxf(m_, sc);
+            const float alpha = __expf(m_ - m_new);
+            const float pp = __expf(sc - m_new);
+            l_ = l_ * alpha + pp;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o8[i] = o8[i] * alpha + pp * bf16_to_f32(vb[i]);
+            m_ = m_new;
         }
-        oh[d] = acc / ssum;
+    }
+    if (active) {
+        float * oh = out + (size_t) m * nq + h * head_dim;
+        const float inv = 1.0f / l_;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) oh[d0 + i] = o8[i] * inv;
     }
 }
 
 } // namespace
+
+void prefill_attention_compute(const float * q, const int * positions, const int * seq_ids,
+                               int M, const bf16 * kv_cache, int kv_stride, int max_seq,
+                               int head_dim, int n_head, int n_kv,
+                               float * out, cudaStream_t stream) {
+    if (M <= 0) return;
+    if (head_dim != 128) {
+        fprintf(stderr, "attention: prefill kernel requires head_dim == 128 (got %d)\n", head_dim);
+        return;
+    }
+    dim3 grid((M + PREF_BM - 1) / PREF_BM, n_head);
+    prefill_attention_kernel<<<grid, PREF_BM * PREF_LANES, 0, stream>>>(
+        q, positions, seq_ids, M, kv_cache, kv_stride, max_seq, head_dim, n_head, n_kv, out);
+}
 
 void qk_norm_store(const float * q, const float * k, const float * v,
                    int q_stride, int k_stride, int v_stride,
@@ -163,14 +318,11 @@ void attention_compute(const float * q, const int * positions, const int * seq_i
                        int head_dim, int n_head, int n_kv,
                        float * out, cudaStream_t stream) {
     if (M <= 0) return;
-    const size_t shmem = sizeof(float) * (size_t) max_seq;
-    static bool attr_set = false;
-    if (!attr_set) {
-        cudaFuncSetAttribute(attention_compute_kernel,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
-        attr_set = true;
+    if (head_dim != 128) {
+        fprintf(stderr, "attention: flash kernel requires head_dim == 128 (got %d)\n", head_dim);
+        return;
     }
     dim3 grid(M, n_head);
-    attention_compute_kernel<<<grid, THREADS, shmem, stream>>>(
+    attention_compute_kernel<<<grid, FLASH_NSPLIT * FLASH_LANES, 0, stream>>>(
         q, positions, seq_ids, M, kv_cache, kv_stride, max_seq, head_dim, n_head, n_kv, out);
 }

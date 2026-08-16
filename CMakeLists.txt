@@ -27,7 +27,28 @@ add_executable(tinyinfer
     src/cuda/attention.cu
     src/cuda/ffn.cu
     src/cuda/lm_head.cu
+    src/cuda/sample.cu
+)
+
+add_executable(tinyinfer-server
+    src/server.cpp
+    src/http.cpp
+    src/json.cpp
+    src/gguf_reader.cpp
+    src/tokenizer.cpp
+    src/model.cpp
+    src/inference.cu
+    src/cuda/rms_norm.cu
+    src/cuda/rope.cu
+    src/cuda/gemm.cu
+    src/cuda/attention.cu
+    src/cuda/ffn.cu
+    src/cuda/lm_head.cu
+    src/cuda/sample.cu
 )
 
 target_link_libraries(tinyinfer PRIVATE CUDA::cudart)
 target_include_directories(tinyinfer PRIVATE src src/cuda)
+
+target_link_libraries(tinyinfer-server PRIVATE CUDA::cudart)
+target_include_directories(tinyinfer-server PRIVATE src src/cuda)

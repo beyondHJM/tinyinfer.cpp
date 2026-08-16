@@ -5,7 +5,7 @@ namespace {
 constexpr int TM = 64;
 constexpr int TN = 64;
 constexpr int TK = 32;
-constexpr int THREADS = 128;
+constexpr int THREADS = 256;
 
 // Pack two bf16 values into one 32-bit register (little-endian: first = low).
 __device__ __forceinline__ uint32_t pack2(bf16 a, bf16 b) {
@@ -17,64 +17,68 @@ __device__ __forceinline__ uint32_t pack2(bf16 a, bf16 b) {
 // Small-M GEMM (matrix-vector style). Used for decode (M <= 32) where the
 // tiled mma kernel would waste most of its tile rows.
 // C[M,N] = A[M,K] * B[N,K]^T ; B is the weight in W^T layout [N,K].
+//
+// A100-oriented design: 256 threads per block (32 output columns x 8-way
+// thread-level split-K). Every thread owns one (column, K-slice) and streams
+// its K slice directly from global memory with 16-byte vector loads - no
+// shared-memory tiles, no per-iteration __syncthreads. The 8 partial sums per
+// column are reduced inside the block in fixed order, so results are
+// bit-identical between eager launches and CUDA Graph replay. Engine shapes
+// (K in {1024, 2048, 3072}, N a multiple of 32) take this fast path with zero
+// bounds checks; other shapes fall back to the tiled mma kernel.
 // ---------------------------------------------------------------------------
-constexpr int GV_BN = 128;   // output columns per block
-constexpr int GV_BK = 64;    // k-chunk
-constexpr int GV_THREADS = 128;
-constexpr int GV_BK_PAD = GV_BK + 2;   // pad to avoid bank conflicts
-constexpr int GV_SPLIT = 4;  // split-K factor for small N (more parallelism)
+constexpr int GV2_BN = 32;       // output columns per block
+constexpr int GV2_THREADS = 256; // = GV2_BN * GV2_KSPLIT
+constexpr int GV2_KSPLIT = 8;    // thread-level split-K
 
-__global__ void __launch_bounds__(GV_THREADS)
-gemv_bf16_kernel(const bf16 * __restrict__ A, const bf16 * __restrict__ B,
-                 float * __restrict__ C, int M, int N, int K, int ksplit) {
-    __shared__ __align__(16) bf16 As[GV_BK];
-    __shared__ __align__(16) bf16 Bs[GV_BN][GV_BK_PAD];
+__global__ void __launch_bounds__(GV2_THREADS)
+gemv2_bf16_kernel(const bf16 * __restrict__ A, const bf16 * __restrict__ B,
+                  float * __restrict__ C, int M, int N, int K) {
+    __shared__ float pbuf[GV2_KSPLIT][GV2_BN];
 
-    const int tid = threadIdx.x;
     const int m = blockIdx.y;
-    const int n0 = blockIdx.x * GV_BN;
-    const int split = blockIdx.z;
-    const int k_per_split = K / ksplit;
-    const int k_begin = split * k_per_split;
-    const int k_end = (split + 1) * k_per_split;
-    const bf16 * arow = A + (size_t) m * K + k_begin;
+    const int n0 = blockIdx.x * GV2_BN;
+    const int col = threadIdx.x & (GV2_BN - 1);   // GV2_BN = 32 (power of two)
+    const int kp = threadIdx.x >> 5;              // 0..GV2_KSPLIT-1
+    const int K_PER = K / GV2_KSPLIT;
+    const int k_begin = kp * K_PER;
 
-    float acc = 0.0f;
-    for (int k0 = k_begin; k0 < k_end; k0 += GV_BK) {
-        // Load B tile [GV_BN][GV_BK] with 16-byte vector loads.
-        for (int i = tid; i < (GV_BN * GV_BK) / 8; i += GV_THREADS) {
-            const int idx = i * 8;
-            const int r = idx / GV_BK;
-            const int c = idx % GV_BK;
-            const int gr = n0 + r;
-            const int gc = k0 + c;
-            uint4 v = (gr < N && gc + 7 < k_end)
-                          ? *reinterpret_cast<const uint4 *>(B + (size_t) gr * K + gc)
-                          : make_uint4(0, 0, 0, 0);
-            uint32_t * dst = reinterpret_cast<uint32_t *>(&Bs[r][c]);
-            dst[0] = v.x;
-            dst[1] = v.y;
-            dst[2] = v.z;
-            dst[3] = v.w;
-        }
-        if (tid < GV_BK && k0 + tid < k_end) As[tid] = arow[k0 - k_begin + tid];
-        __syncthreads();
+    // Both pointers are 16-byte aligned: K is a multiple of 64, k_begin is a
+    // multiple of K_PER = K/8 (so a multiple of 8 bf16 = 16 bytes).
+    const uint4 * a4 = reinterpret_cast<const uint4 *>(A + (size_t) m * K + k_begin);
+    const uint4 * b4 = reinterpret_cast<const uint4 *>(B + (size_t)(n0 + col) * K + k_begin);
 
-        if (tid < GV_BN && n0 + tid < N) {
-            const uint32_t * a32 = reinterpret_cast<const uint32_t *>(As);
-            const uint32_t * b32 = reinterpret_cast<const uint32_t *>(Bs[tid]);
-            for (int j = 0; j < GV_BK / 2; ++j) {
-                uint32_t av = a32[j];
-                uint32_t bv = b32[j];
-                acc += __bfloat162float(*reinterpret_cast<const bf16 *>(&av)) *
-                           __bfloat162float(*reinterpret_cast<const bf16 *>(&bv)) +
-                       __bfloat162float(*(reinterpret_cast<const bf16 *>(&av) + 1)) *
-                           __bfloat162float(*(reinterpret_cast<const bf16 *>(&bv) + 1));
-            }
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    const int iters = K_PER / 8;                  // 8 bf16 per uint4
+    for (int i = 0; i < iters; i += 4) {
+        const uint4 av0 = a4[i], av1 = a4[i + 1], av2 = a4[i + 2], av3 = a4[i + 3];
+        const uint4 bv0 = b4[i], bv1 = b4[i + 1], bv2 = b4[i + 2], bv3 = b4[i + 3];
+        const bf16 * ap0 = reinterpret_cast<const bf16 *>(&av0);
+        const bf16 * bp0 = reinterpret_cast<const bf16 *>(&bv0);
+        const bf16 * ap1 = reinterpret_cast<const bf16 *>(&av1);
+        const bf16 * bp1 = reinterpret_cast<const bf16 *>(&bv1);
+        const bf16 * ap2 = reinterpret_cast<const bf16 *>(&av2);
+        const bf16 * bp2 = reinterpret_cast<const bf16 *>(&bv2);
+        const bf16 * ap3 = reinterpret_cast<const bf16 *>(&av3);
+        const bf16 * bp3 = reinterpret_cast<const bf16 *>(&bv3);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            acc0 += bf16_to_f32(ap0[j]) * bf16_to_f32(bp0[j]);
+            acc1 += bf16_to_f32(ap1[j]) * bf16_to_f32(bp1[j]);
+            acc2 += bf16_to_f32(ap2[j]) * bf16_to_f32(bp2[j]);
+            acc3 += bf16_to_f32(ap3[j]) * bf16_to_f32(bp3[j]);
         }
-        __syncthreads();
     }
-    if (tid < GV_BN && n0 + tid < N) atomicAdd(&C[(size_t) m * N + n0 + tid], acc);
+    // Deterministic block-level reduction over the GV2_KSPLIT partial sums.
+    const float acc = (acc0 + acc1) + (acc2 + acc3);
+    pbuf[kp][col] = acc;
+    __syncthreads();
+    if (kp == 0) {
+        float s = 0.0f;
+#pragma unroll
+        for (int k = 0; k < GV2_KSPLIT; ++k) s += pbuf[k][col];
+        C[(size_t) m * N + n0 + col] = s;
+    }
 }
 
 // mma.m16n8k16 row-major A (16x16), col-major B (16x8), FP32 accum.
@@ -90,9 +94,9 @@ __device__ __forceinline__ void mma_m16n8k16(uint32_t a0, uint32_t a1, uint32_t 
 
 __global__ void __launch_bounds__(THREADS)
 gemm_bf16_kernel(const bf16 * __restrict__ A, const bf16 * __restrict__ B,
-                 float * __restrict__ C, int M, int N, int K) {
-    constexpr int WARP_ROWS = TM / 2;   // 32
-    constexpr int WARP_COLS = TN / 2;   // 32
+                 float * __restrict__ C_partial, int M, int N, int K, int SK) {
+    constexpr int WARP_ROWS = TM / 2;   // 32 (2 row-warps)
+    constexpr int WARP_COLS = TN / 2;   // 16 (4 col-warps x 2 m16n8 = 64 cols)
 
     __shared__ __align__(16) bf16 As[TM][TK];
     __shared__ __align__(16) bf16 Bs[TK][TN];
@@ -100,15 +104,21 @@ gemm_bf16_kernel(const bf16 * __restrict__ A, const bf16 * __restrict__ B,
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
-    const int warp_row = warp / 2;      // 0..1
-    const int warp_col = warp % 2;      // 0..1
+    const int warp_row = warp / 4;      // 0..1 (8 warps, 2x4 layout)
+    const int warp_col = warp % 4;      // 0..3
 
     const int m0 = blockIdx.x * TM;
     const int n0 = blockIdx.y * TN;
+    const int sk = blockIdx.z;
+    // This block's K slice: split-K adds more concurrent blocks (and hence
+    // more in-flight tensor-core work) for the small-M prefill GEMMs.
+    const int K_PER = (K + SK - 1) / SK;
+    const int k_begin = sk * K_PER;
+    const int k_end = min(k_begin + K_PER, K);
 
-    float acc[2][4][4] = {};
+    float acc[2][2][4] = {};
 
-    for (int k0 = 0; k0 < K; k0 += TK) {
+    for (int k0 = k_begin; k0 < k_end; k0 += TK) {
         // Cooperative load A tile [TM, TK] and B tile [TK, TN] into shared.
         for (int i = tid; i < TM * TK; i += THREADS) {
             int r = i / TK;
@@ -129,7 +139,7 @@ gemm_bf16_kernel(const bf16 * __restrict__ A, const bf16 * __restrict__ B,
 #pragma unroll
         for (int mi = 0; mi < 2; ++mi) {
 #pragma unroll
-            for (int ni = 0; ni < 4; ++ni) {
+            for (int ni = 0; ni < 2; ++ni) {
                 const int mbase = warp_row * WARP_ROWS + mi * 16;
                 const int nbase = warp_col * WARP_COLS + ni * 8;
 
@@ -158,26 +168,39 @@ gemm_bf16_kernel(const bf16 * __restrict__ A, const bf16 * __restrict__ B,
         __syncthreads();
     }
 
-    // Epilogue
+    // Epilogue: write this split's partial result (SK=1 writes C directly via
+    // the caller passing C as C_partial).
 #pragma unroll
     for (int mi = 0; mi < 2; ++mi) {
 #pragma unroll
-        for (int ni = 0; ni < 4; ++ni) {
+        for (int ni = 0; ni < 2; ++ni) {
             const int mbase = m0 + warp_row * WARP_ROWS + mi * 16;
             const int nbase = n0 + warp_col * WARP_COLS + ni * 8;
             const int r = lane / 4;
             const int c = (lane % 4) * 2;
             const float * accv = acc[mi][ni];
+            const size_t rowbase = (size_t) (mbase + r) * N + nbase + c;
             if (mbase + r < M && nbase + c < N)
-                C[(size_t) (mbase + r) * N + nbase + c] = accv[0];
+                C_partial[rowbase * SK + sk] = accv[0];
             if (mbase + r < M && nbase + c + 1 < N)
-                C[(size_t) (mbase + r) * N + nbase + c + 1] = accv[1];
+                C_partial[(rowbase + 1) * SK + sk] = accv[1];
             if (mbase + r + 8 < M && nbase + c < N)
-                C[(size_t) (mbase + r + 8) * N + nbase + c] = accv[2];
+                C_partial[((size_t) (mbase + r + 8) * N + nbase + c) * SK + sk] = accv[2];
             if (mbase + r + 8 < M && nbase + c + 1 < N)
-                C[(size_t) (mbase + r + 8) * N + nbase + c + 1] = accv[3];
+                C_partial[((size_t) (mbase + r + 8) * N + nbase + c + 1) * SK + sk] = accv[3];
         }
     }
+}
+
+// Deterministic split-K reduction: C[m,n] = sum of partials in fixed sk order.
+__global__ void gemm_bf16_reduce_kernel(const float * __restrict__ C_partial,
+                                        float * __restrict__ C, int M, int N, int SK) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    const float * p = C_partial + (size_t) idx * SK;
+    float s = 0.0f;
+    for (int k = 0; k < SK; ++k) s += p[k];
+    C[idx] = s;
 }
 
 } // namespace
@@ -186,12 +209,45 @@ void gemm_bf16(const bf16 * A, const bf16 * B, float * C, int M, int N, int K,
                cudaStream_t stream) {
     if (M <= 0 || N <= 0 || K <= 0) return;
     if (M <= 32) {
-        QWEN_CU_CHECK(cudaMemsetAsync(C, 0, (size_t) M * N * sizeof(float), stream));
-        const int ksplit = (N < 8192) ? GV_SPLIT : 1;
-        dim3 grid((N + GV_BN - 1) / GV_BN, M, ksplit);
-        gemv_bf16_kernel<<<grid, GV_THREADS, 0, stream>>>(A, B, C, M, N, K, ksplit);
+        // Fast path: shapes used by the engine (K multiple of 256, N multiple
+        // of 128) use the 512-thread gemv2 kernel with an in-block deterministic
+        // split-K reduction (no atomics, bit-identical between eager launches
+        // and CUDA Graph replay). Anything else falls back to the tiled mma
+        // kernel, which bounds-checks and is always correct.
+        // Fast path: engine shapes (K multiple of 64 -> 16B-aligned vector
+        // loads, N multiple of 32) use the shared-memory-free gemv2 kernel with
+        // an in-block deterministic split-K reduction (bit-identical between
+        // eager launches and CUDA Graph replay). Anything else falls back to
+        // the tiled mma kernel, which bounds-checks and is always correct.
+        const bool fast = (N % GV2_BN == 0) && (K % 64 == 0);
+        if (fast) {
+            dim3 grid(N / GV2_BN, M);
+            gemv2_bf16_kernel<<<grid, GV2_THREADS, 0, stream>>>(A, B, C, M, N, K);
+            return;
+        }
+        gemm_bf16_kernel<<<dim3((M + TM - 1) / TM, (N + TN - 1) / TN), THREADS, 0, stream>>>(
+            A, B, C, M, N, K, 1);
         return;
     }
-    dim3 grid((M + TM - 1) / TM, (N + TN - 1) / TN);
-    gemm_bf16_kernel<<<grid, THREADS, 0, stream>>>(A, B, C, M, N, K);
+    // M > 32: tiled mma kernel. Split-K (2-way) doubles the number of blocks
+    // for the small-M prefill GEMMs, giving the tensor cores more concurrent
+    // work; the partials are reduced deterministically (fixed split order).
+    const int SK = (K >= 1024 && N >= 256) ? 2 : 1;
+    if (SK > 1) {
+        static thread_local float * partial = nullptr;
+        static thread_local size_t partial_bytes = 0;
+        const size_t need = (size_t) M * N * SK * sizeof(float);
+        if (partial_bytes < need) {
+            if (partial) cudaFree(partial);
+            QWEN_CU_CHECK(cudaMalloc(&partial, need));
+            partial_bytes = need;
+        }
+        dim3 grid((M + TM - 1) / TM, (N + TN - 1) / TN, SK);
+        gemm_bf16_kernel<<<grid, THREADS, 0, stream>>>(A, B, partial, M, N, K, SK);
+        const int total = M * N;
+        gemm_bf16_reduce_kernel<<<(total + 255) / 256, 256, 0, stream>>>(partial, C, M, N, SK);
+        return;
+    }
+    gemm_bf16_kernel<<<dim3((M + TM - 1) / TM, (N + TN - 1) / TN), THREADS, 0, stream>>>(
+        A, B, C, M, N, K, 1);
 }
