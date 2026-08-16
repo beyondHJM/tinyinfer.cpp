@@ -3,7 +3,7 @@
 [![GitHub](https://img.shields.io/github/stars/beyondHJM/tinyinfer.cpp?style=social)](https://github.com/beyondHJM/tinyinfer.cpp)
 [![GitHub license](https://img.shields.io/github/license/beyondHJM/tinyinfer.cpp)](https://github.com/beyondHJM/tinyinfer.cpp/blob/master/LICENSE.txt)
 
-A lightweight LLM inference engine in ~3000 lines of C++/CUDA: self-contained,
+A lightweight LLM inference engine in ~4,700 lines of C++/CUDA: self-contained,
 NVIDIA GPU only, and **zero third-party CUDA library dependencies**
 (no cuBLAS / cuDNN / cuBLASLt / CUTLASS).
 
@@ -15,8 +15,11 @@ validated against the GGUF metadata - nothing is hardcoded.
 
 - Offline batched inference: multiple prompts in a single run
 - NVIDIA GPU only (CUDA 12.x, sm_80), no CPU fallback
-- Custom CUDA kernels: BF16 tensor-core GEMM, split-K GEMM for decode,
-  GQA causal attention, NeoX RoPE, RMSNorm, SwiGLU, LM head
+- Custom CUDA kernels: BF16 tensor-core GEMM (split-K), FlashDecoding GQA
+  causal attention, NeoX RoPE, RMSNorm, SwiGLU, LM head
+- CUDA Graph replay for the decode phase (bit-identical to eager, ~15-20% faster)
+- GPU sampling: softmax + top-k candidate extraction on the GPU, so
+  temperature > 0 barely affects throughput
 - Self-contained Qwen3 BPE tokenizer (byte encoding + Qwen2 pre-tokenizer)
 - Chat mode (`--chat`, Qwen3 im_start/im_end template)
 - Operator self-test: `QWEN_SELFTEST=1`
@@ -83,7 +86,7 @@ sure I explain it clearly without getting too technical.
 | `--chat` | Chat mode (Qwen3 chat template) |
 | `-t` / `--top-k` / `--top-p` / `--seed` | Sampling parameters (`-t 0` = greedy) |
 | `--max-seq` | Max KV-cache length per sequence (default 2048) |
-| `--cuda-graph` | Replay the decode phase with CUDA Graphs (off by default; ~10-15% faster decode) |
+| `--cuda-graph` | Replay the decode phase with CUDA Graphs (off by default; ~15-20% faster decode) |
 | `--verbose` | Print token-level information |
 
 ## Batch Example
@@ -102,11 +105,11 @@ printf 'Hello\nPlease introduce AI Agent briefly\n' > prompts.txt
 - **CUDA Graph replay** (`--cuda-graph`): the decode kernel sequence is captured
   once per batch size and replayed via `cudaGraphLaunch`. The small-M GEMM uses
   a deterministic thread-level split-K reduction, so graph replay is bit-identical
-  to eager execution (verified with `QWEN_GRAPH_VERIFY=1`). Measured on an A100:
-  single-sequence decode goes from ~265 tok/s (eager) to ~306 tok/s (graph),
-  about +15%.
-- **Performance**: ~306 tok/s single-sequence decode with CUDA Graphs on an A100
-  (vs ~176 tok/s for the original eager implementation).
+  to eager execution (verified with `QWEN_GRAPH_VERIFY=1`).
+- **Performance** (measured on an A100, Qwen3-0.6B BF16, single-sequence
+  decode): ~266-268 tok/s eager, ~310-330 tok/s with CUDA Graphs (~318 tok/s
+  average, about +19%). Because sampling runs on the GPU, temperature > 0 does
+  not measurably slow down generation.
 
 ## Module Provenance
 
