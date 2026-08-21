@@ -16,6 +16,11 @@ constexpr int SAM_THREADS = 512;
 constexpr int SAM_TOP_PER_THREAD = 16;
 constexpr int SAM_CAND_PER_SEQ = SAM_THREADS * SAM_TOP_PER_THREAD;  // 8192
 
+// Greedy sampling entirely on the GPU. Only M token ids are copied to the
+// host, instead of M*n_vocab FP32 logits.
+void sample_argmax(const float * logits, int M, int n_vocab,
+                   int * token_ids, cudaStream_t stream = 0);
+
 // For each of the M sequences, fill cand_vals[m*CAND + i] = softmax prob and
 // cand_idx[m*CAND + i] = vocab index of the i-th candidate (top-16 per thread).
 // Runs on the given stream; callers must ensure `logits` is ready on it.

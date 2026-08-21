@@ -18,8 +18,8 @@ validated against the GGUF metadata - nothing is hardcoded.
 - Custom CUDA kernels: BF16 tensor-core GEMM (split-K), FlashDecoding GQA
   causal attention, NeoX RoPE, RMSNorm, SwiGLU, LM head
 - CUDA Graph replay for the decode phase (bit-identical to eager, ~15-20% faster)
-- GPU sampling: softmax + top-k candidate extraction on the GPU, so
-  temperature > 0 barely affects throughput
+- GPU sampling: the CLI greedy path uses GPU argmax, while the server uses
+  GPU softmax + top-k candidate extraction
 - Self-contained Qwen3 BPE tokenizer (byte encoding + Qwen2 pre-tokenizer)
 - Chat mode (`--chat`, Qwen3 im_start/im_end template)
 - Operator self-test: `QWEN_SELFTEST=1`
@@ -47,6 +47,14 @@ Or manually:
 export PATH=/usr/local/cuda/bin:$PATH
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j "$(nproc)"
+```
+
+For an RTX 5090, use a CUDA toolkit with Blackwell support and build the native
+SM120 kernels:
+
+```bash
+cmake -B build-sm120 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build-sm120 -j "$(nproc)"
 ```
 
 ### 3. Install (optional)
@@ -108,8 +116,8 @@ printf 'Hello\nPlease introduce AI Agent briefly\n' > prompts.txt
   to eager execution (verified with `QWEN_GRAPH_VERIFY=1`).
 - **Performance** (measured on an A100, Qwen3-0.6B BF16, single-sequence
   decode): ~266-268 tok/s eager, ~310-330 tok/s with CUDA Graphs (~318 tok/s
-  average, about +19%). Because sampling runs on the GPU, temperature > 0 does
-  not measurably slow down generation.
+  average, about +19%). The CLI greedy path and server candidate path avoid
+  copying full-vocabulary logits to the host.
 
 ## Module Provenance
 

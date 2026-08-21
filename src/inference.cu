@@ -181,7 +181,8 @@ bool Inference::forward(const std::vector<int32_t> & tokens,
                         int n_seqs,
                         std::vector<float> & last_logits,
                         std::vector<float> * cand_probs,
-                        std::vector<int> * cand_idx) {
+                        std::vector<int> * cand_idx,
+                        std::vector<int> * greedy_ids) {
     const int M = (int) tokens.size();
     if (M == 0 || M > max_tokens_ || n_seqs > max_batch_) return false;
     const int n_vocab = model_->cfg.n_vocab;
@@ -206,6 +207,15 @@ bool Inference::forward(const std::vector<int32_t> & tokens,
         cudaGraphExec_t g = get_or_capture_decode_graph(M, n_seqs);
         if (g) {
             QWEN_CU_CHECK(cudaGraphLaunch(g, graph_stream_));
+            if (greedy_ids) {
+                sample_argmax(logits_, n_seqs, n_vocab, cand_idx_, graph_stream_);
+                greedy_ids->resize(n_seqs);
+                QWEN_CU_CHECK(cudaMemcpyAsync(greedy_ids->data(), cand_idx_,
+                                              greedy_ids->size() * sizeof(int),
+                                              cudaMemcpyDeviceToHost, graph_stream_));
+                QWEN_CU_CHECK(cudaStreamSynchronize(graph_stream_));
+                return true;
+            }
             QWEN_CU_CHECK(cudaStreamSynchronize(graph_stream_));
             if (cand_probs && cand_idx) {
                 sample_topk_probs(logits_, n_seqs, n_vocab, cand_vals_, cand_idx_, 0);
@@ -231,7 +241,12 @@ bool Inference::forward(const std::vector<int32_t> & tokens,
     launch_forward_kernels(M, n_seqs, 0);
     QWEN_CU_CHECK_LAST();
 
-    if (cand_probs && cand_idx) {
+    if (greedy_ids) {
+        sample_argmax(logits_, n_seqs, n_vocab, cand_idx_, 0);
+        greedy_ids->resize(n_seqs);
+        QWEN_CU_CHECK(cudaMemcpy(greedy_ids->data(), cand_idx_,
+                                 greedy_ids->size() * sizeof(int), cudaMemcpyDeviceToHost));
+    } else if (cand_probs && cand_idx) {
         sample_topk_probs(logits_, n_seqs, n_vocab, cand_vals_, cand_idx_, 0);
         cand_probs->resize((size_t) n_seqs * SAM_CAND_PER_SEQ);
         cand_idx->resize((size_t) n_seqs * SAM_CAND_PER_SEQ);

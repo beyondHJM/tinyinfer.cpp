@@ -218,12 +218,15 @@ int main(int argc, char ** argv) {
         }
     }
     std::vector<float> logits;
+    std::vector<int> greedy_ids;
+    const bool use_gpu_argmax = sp.temp <= 0.0f && !verbose && !getenv("QWEN_CPU_SAMPLING");
     std::vector<int> gen_len(n_seqs, 0);
     std::vector<bool> finished(n_seqs, false);
     std::vector<std::string> output(n_seqs);
 
     auto t0 = std::chrono::steady_clock::now();
-    if (!infer.forward(batch_tokens, batch_pos, batch_seq, n_seqs, logits)) return 1;
+    if (!infer.forward(batch_tokens, batch_pos, batch_seq, n_seqs, logits, nullptr, nullptr,
+                       use_gpu_argmax ? &greedy_ids : nullptr)) return 1;
     auto t1 = std::chrono::steady_clock::now();
     double prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -247,7 +250,8 @@ int main(int argc, char ** argv) {
 
     int generated = 0;
     for (int s = 0; s < n_seqs; ++s) {
-        int id = sample_token(&logits[(size_t) s * n_vocab], n_vocab, sp);
+        int id = use_gpu_argmax ? greedy_ids[s]
+                                : sample_token(&logits[(size_t) s * n_vocab], n_vocab, sp);
         if (tok.is_eog(id)) { finished[s] = true; continue; }
         output[s] += tok.token_to_piece(id);
         toks[s].push_back(id);
@@ -271,13 +275,15 @@ int main(int argc, char ** argv) {
         if (dec_tokens.empty()) break;
         if (generated >= n_seqs + n_predict) break;
 
-        if (!infer.forward(dec_tokens, dec_pos, dec_seq, n_seqs, logits)) return 1;
+        if (!infer.forward(dec_tokens, dec_pos, dec_seq, n_seqs, logits, nullptr, nullptr,
+                           use_gpu_argmax ? &greedy_ids : nullptr)) return 1;
 
         int active = 0;
         for (int s = 0; s < n_seqs; ++s) {
             if (finished[s]) continue;
             if (gen_len[s] >= n_predict) { finished[s] = true; continue; }
-            int id = sample_token(&logits[(size_t) s * n_vocab], n_vocab, sp);
+            int id = use_gpu_argmax ? greedy_ids[s]
+                                    : sample_token(&logits[(size_t) s * n_vocab], n_vocab, sp);
             if (tok.is_eog(id)) { finished[s] = true; continue; }
             output[s] += tok.token_to_piece(id);
             toks[s].push_back(id);

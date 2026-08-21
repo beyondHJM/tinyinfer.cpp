@@ -31,6 +31,9 @@ constexpr int GV2_BN = 32;       // output columns per block
 constexpr int GV2_THREADS = 256; // = GV2_BN * GV2_KSPLIT
 constexpr int GV2_KSPLIT = 8;    // thread-level split-K
 
+constexpr int WGV_WARPS = 8;
+constexpr int WGV_THREADS = WGV_WARPS * 32;
+
 __global__ void __launch_bounds__(GV2_THREADS)
 gemv2_bf16_kernel(const bf16 * __restrict__ A, const bf16 * __restrict__ B,
                   float * __restrict__ C, int M, int N, int K) {
@@ -79,6 +82,60 @@ gemv2_bf16_kernel(const bf16 * __restrict__ A, const bf16 * __restrict__ B,
         for (int k = 0; k < GV2_KSPLIT; ++k) s += pbuf[k][col];
         C[(size_t) m * N + n0 + col] = s;
     }
+}
+
+// SM120 decode path. Each warp owns one output row, so adjacent lanes read
+// adjacent BF16 weights. This is substantially more bandwidth-efficient on
+// Blackwell than assigning adjacent lanes to K-strided output rows.
+__global__ void __launch_bounds__(WGV_THREADS)
+gemv_warp_bf16_kernel(const bf16 * __restrict__ A, const bf16 * __restrict__ B,
+                      float * __restrict__ C, int M, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int m = blockIdx.y;
+    const int n = blockIdx.x * WGV_WARPS + warp;
+    if (m >= M || n >= N) return;
+
+    const bf16 * a = A + (size_t) m * K;
+    const bf16 * b = B + (size_t) n * K;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (int k = lane * 8; k < K; k += 32 * 8) {
+        const uint4 av = *reinterpret_cast<const uint4 *>(a + k);
+        const uint4 bv = *reinterpret_cast<const uint4 *>(b + k);
+        const bf16 * ap = reinterpret_cast<const bf16 *>(&av);
+        const bf16 * bp = reinterpret_cast<const bf16 *>(&bv);
+        acc0 = fmaf(bf16_to_f32(ap[0]), bf16_to_f32(bp[0]), acc0);
+        acc1 = fmaf(bf16_to_f32(ap[1]), bf16_to_f32(bp[1]), acc1);
+        acc2 = fmaf(bf16_to_f32(ap[2]), bf16_to_f32(bp[2]), acc2);
+        acc3 = fmaf(bf16_to_f32(ap[3]), bf16_to_f32(bp[3]), acc3);
+        acc0 = fmaf(bf16_to_f32(ap[4]), bf16_to_f32(bp[4]), acc0);
+        acc1 = fmaf(bf16_to_f32(ap[5]), bf16_to_f32(bp[5]), acc1);
+        acc2 = fmaf(bf16_to_f32(ap[6]), bf16_to_f32(bp[6]), acc2);
+        acc3 = fmaf(bf16_to_f32(ap[7]), bf16_to_f32(bp[7]), acc3);
+    }
+
+    float sum = (acc0 + acc1) + (acc2 + acc3);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) C[(size_t) m * N + n] = sum;
+}
+
+bool use_sm120_warp_gemv() {
+    static const bool enabled = [] {
+        if (getenv("QWEN_GEMV_LEGACY")) return false;
+        int device = 0;
+        cudaDeviceProp properties{};
+        QWEN_CU_CHECK(cudaGetDevice(&device));
+        QWEN_CU_CHECK(cudaGetDeviceProperties(&properties, device));
+        return properties.major == 12;
+    }();
+    return enabled;
 }
 
 // mma.m16n8k16 row-major A (16x16), col-major B (16x8), FP32 accum.
@@ -209,18 +266,16 @@ void gemm_bf16(const bf16 * A, const bf16 * B, float * C, int M, int N, int K,
                cudaStream_t stream) {
     if (M <= 0 || N <= 0 || K <= 0) return;
     if (M <= 32) {
-        // Fast path: shapes used by the engine (K multiple of 256, N multiple
-        // of 128) use the 512-thread gemv2 kernel with an in-block deterministic
-        // split-K reduction (no atomics, bit-identical between eager launches
-        // and CUDA Graph replay). Anything else falls back to the tiled mma
-        // kernel, which bounds-checks and is always correct.
         // Fast path: engine shapes (K multiple of 64 -> 16B-aligned vector
-        // loads, N multiple of 32) use the shared-memory-free gemv2 kernel with
-        // an in-block deterministic split-K reduction (bit-identical between
-        // eager launches and CUDA Graph replay). Anything else falls back to
-        // the tiled mma kernel, which bounds-checks and is always correct.
+        // loads, N multiple of 32) use a shared-memory-free GEMV kernel.
+        // Anything else falls back to the bounds-checked tiled MMA kernel.
         const bool fast = (N % GV2_BN == 0) && (K % 64 == 0);
         if (fast) {
+            if (use_sm120_warp_gemv()) {
+                dim3 grid((N + WGV_WARPS - 1) / WGV_WARPS, M);
+                gemv_warp_bf16_kernel<<<grid, WGV_THREADS, 0, stream>>>(A, B, C, M, N, K);
+                return;
+            }
             dim3 grid(N / GV2_BN, M);
             gemv2_bf16_kernel<<<grid, GV2_THREADS, 0, stream>>>(A, B, C, M, N, K);
             return;

@@ -2,6 +2,57 @@
 
 namespace {
 
+__device__ __forceinline__ void keep_better(float other_value, int other_index,
+                                             float & value, int & index) {
+    if (other_value > value || (other_value == value && other_index < index)) {
+        value = other_value;
+        index = other_index;
+    }
+}
+
+__global__ void __launch_bounds__(SAM_THREADS)
+argmax_kernel(const float * __restrict__ logits, int n_vocab,
+              int * __restrict__ token_ids) {
+    __shared__ float warp_values[SAM_THREADS / 32];
+    __shared__ int warp_indices[SAM_THREADS / 32];
+
+    const int m = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const float * row = logits + (size_t) m * n_vocab;
+
+    float value = -INFINITY;
+    int index = 0;
+    for (int i = tid; i < n_vocab; i += SAM_THREADS) {
+        keep_better(row[i], i, value, index);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other_value = __shfl_down_sync(0xffffffffu, value, offset);
+        const int other_index = __shfl_down_sync(0xffffffffu, index, offset);
+        keep_better(other_value, other_index, value, index);
+    }
+    if (lane == 0) {
+        warp_values[warp] = value;
+        warp_indices[warp] = index;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        const int n_warps = SAM_THREADS / 32;
+        value = lane < n_warps ? warp_values[lane] : -INFINITY;
+        index = lane < n_warps ? warp_indices[lane] : 0;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other_value = __shfl_down_sync(0xffffffffu, value, offset);
+            const int other_index = __shfl_down_sync(0xffffffffu, index, offset);
+            keep_better(other_value, other_index, value, index);
+        }
+        if (lane == 0) token_ids[m] = index;
+    }
+}
+
 __global__ void __launch_bounds__(SAM_THREADS)
 topk_probs_kernel(const float * __restrict__ logits, int n_vocab,
                   float * __restrict__ cand_vals, int * __restrict__ cand_idx) {
@@ -52,6 +103,12 @@ topk_probs_kernel(const float * __restrict__ logits, int n_vocab,
 }
 
 } // namespace
+
+void sample_argmax(const float * logits, int M, int n_vocab,
+                   int * token_ids, cudaStream_t stream) {
+    if (M <= 0 || n_vocab <= 0) return;
+    argmax_kernel<<<M, SAM_THREADS, 0, stream>>>(logits, n_vocab, token_ids);
+}
 
 void sample_topk_probs(const float * logits, int M, int n_vocab,
                        float * cand_vals, int * cand_idx, cudaStream_t stream) {

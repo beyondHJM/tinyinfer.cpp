@@ -27,7 +27,8 @@ public:
     // at position positions[i]. Copies the last-token logits of every sequence
     // to last_logits (host, [n_seqs * n_vocab]).
     //
-    // If cand_probs/cand_idx are non-null, the full logits are NOT copied back;
+    // If greedy_ids is non-null, a GPU argmax copies back only one token id per
+    // sequence. If cand_probs/cand_idx are non-null, the full logits are not copied back;
     // instead the GPU softmax + top-k pass fills them with SAM_CAND_PER_SEQ
     // (prob, index) candidates per sequence (see sample.cuh), which is much
     // cheaper for host-side sampling.
@@ -37,7 +38,8 @@ public:
                  int n_seqs,
                  std::vector<float> & last_logits,
                  std::vector<float> * cand_probs = nullptr,
-                 std::vector<int> * cand_idx = nullptr);
+                 std::vector<int> * cand_idx = nullptr,
+                 std::vector<int> * greedy_ids = nullptr);
 
     int n_vocab() const { return model_ ? model_->cfg.n_vocab : 0; }
 
